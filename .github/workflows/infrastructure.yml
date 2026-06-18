@@ -1,0 +1,137 @@
+name: Provision Cloudflare Infrastructure
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+  
+    - name: Install Wrangler
+      run: npm install -g wrangler@latest
+  
+    - name: Extract resources from wrangler.jsonc
+      id: resources
+      run: |
+        PROD_BUCKET=$(jq -r '.r2_buckets[0].bucket_name // empty' wrangler.jsonc)
+        DEV_BUCKET=$(jq -r '.r2_buckets[0].preview_bucket_name // empty' wrangler.jsonc)
+  
+        PROD_DB=$(jq -r '.d1_databases[0].database_name // empty' wrangler.jsonc)
+        DEV_DB=$(jq -r '.env.preview.d1_databases[0].database_name // empty' wrangler.jsonc)
+  
+        PROD_DB_ID=$(jq -r '.d1_databases[0].database_id // empty' wrangler.jsonc)
+        DEV_DB_ID=$(jq -r '.env.preview.d1_databases[0].database_id // empty' wrangler.jsonc)
+  
+        echo "prod_bucket=$PROD_BUCKET" >> $GITHUB_OUTPUT
+        echo "dev_bucket=$DEV_BUCKET" >> $GITHUB_OUTPUT
+        echo "prod_db=$PROD_DB" >> $GITHUB_OUTPUT
+        echo "dev_db=$DEV_DB" >> $GITHUB_OUTPUT
+        echo "prod_db_id=$PROD_DB_ID" >> $GITHUB_OUTPUT
+        echo "dev_db_id=$DEV_DB_ID" >> $GITHUB_OUTPUT
+  
+    - name: Create development R2 bucket
+      if: steps.resources.outputs.dev_bucket != ''
+      uses: cloudflare/wrangler-action@v3
+      continue-on-error: true
+      with:
+        apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        command: r2 bucket create ${{ steps.resources.outputs.dev_bucket }}
+  
+    - name: Create production R2 bucket
+      if: steps.resources.outputs.prod_bucket != ''
+      uses: cloudflare/wrangler-action@v3
+      continue-on-error: true
+      with:
+        apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        command: r2 bucket create ${{ steps.resources.outputs.prod_bucket }}
+  
+    - name: Create preview D1 database
+      if: steps.resources.outputs.dev_db != '' && steps.resources.outputs.dev_db_id == ''
+      id: create_dev_db
+      run: |
+        OUTPUT=$(wrangler d1 create "${{ steps.resources.outputs.dev_db }}" \
+          --api-token "${{ secrets.CLOUDFLARE_API_TOKEN }}")
+  
+        echo "$OUTPUT"
+  
+        DB_ID=$(echo "$OUTPUT" | grep -oE '[0-9a-f-]{36}' | head -1)
+  
+        if [ -z "$DB_ID" ]; then
+          echo "Failed to extract preview database ID"
+          exit 1
+        fi
+  
+        echo "db_id=$DB_ID" >> $GITHUB_OUTPUT
+  
+    - name: Create production D1 database
+      if: steps.resources.outputs.prod_db != '' && steps.resources.outputs.prod_db_id == ''
+      id: create_prod_db
+      run: |
+        OUTPUT=$(wrangler d1 create "${{ steps.resources.outputs.prod_db }}" \
+          --api-token "${{ secrets.CLOUDFLARE_API_TOKEN }}")
+  
+        echo "$OUTPUT"
+  
+        DB_ID=$(echo "$OUTPUT" | grep -oE '[0-9a-f-]{36}' | head -1)
+  
+        if [ -z "$DB_ID" ]; then
+          echo "Failed to extract production database ID"
+          exit 1
+        fi
+  
+        echo "db_id=$DB_ID" >> $GITHUB_OUTPUT
+  
+    - name: Update preview database ID in wrangler.jsonc
+      if: steps.create_dev_db.outputs.db_id != ''
+      run: |
+        jq \
+          '.env.preview.d1_databases[0].database_id = "${{ steps.create_dev_db.outputs.db_id }}"' \
+          wrangler.jsonc > wrangler.tmp
+  
+        mv wrangler.tmp wrangler.jsonc
+  
+    - name: Update production database ID in wrangler.jsonc
+      if: steps.create_prod_db.outputs.db_id != ''
+      run: |
+        jq \
+          '.d1_databases[0].database_id = "${{ steps.create_prod_db.outputs.db_id }}"' \
+          wrangler.jsonc > wrangler.tmp
+  
+        mv wrangler.tmp wrangler.jsonc
+  
+    - name: Commit updated wrangler.jsonc
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+  
+        if git diff --quiet wrangler.jsonc; then
+          echo "No changes detected"
+          exit 0
+        fi
+  
+        git add wrangler.jsonc
+        git commit -m "chore: update Cloudflare resource IDs"
+        git push
+  
+    - name: List D1 databases
+      run: |
+        wrangler d1 list \
+          --api-token "${{ secrets.CLOUDFLARE_API_TOKEN }}"
+  
+    - name: List R2 buckets
+      run: |
+        wrangler r2 bucket list \
+          --api-token "${{ secrets.CLOUDFLARE_API_TOKEN }}"
+
